@@ -26,6 +26,8 @@ from dust3r.utils.misc import (
 from dust3r.heads import head_factory
 from dust3r.utils.camera import PoseEncoder
 from dust3r.patch_embed import get_patch_embed
+from dust3r.state_api import PersistentState, pack_state_args, unpack_state_args
+from dust3r.stable_propagation import TrendPropagator, apply_state_update
 import dust3r.utils.path_to_croco  # noqa: F401
 from models.croco import CroCoNet, CrocoConfig  # noqa
 from dust3r.blocks import (
@@ -114,6 +116,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         rgb_head=False,
         pose_conf_head=False,
         pose_head=False,
+        use_stable_propagation=False,
         **croco_kwargs,
     ):
         super().__init__()
@@ -134,6 +137,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.rgb_head = rgb_head
         self.pose_conf_head = pose_conf_head
         self.pose_head = pose_head
+        self.use_stable_propagation = use_stable_propagation
         self.croco_kwargs = croco_kwargs
 
 
@@ -303,6 +307,12 @@ class ARCroco3DStereo(CroCoNet):
             config.pose_conf_head,
             config.pose_head,
             **self.croco_args,
+        )
+        self.use_stable_propagation = config.use_stable_propagation
+        self.trend_propagator = (
+            TrendPropagator(self.dec_embed_dim)
+            if self.use_stable_propagation
+            else None
         )
         self.set_freeze(config.freeze)
 
@@ -478,6 +488,20 @@ class ARCroco3DStereo(CroCoNet):
     def _set_prediction_head(self, *args, **kwargs):
         """No prediction head"""
         return
+
+    @staticmethod
+    def _pack_state(state_feat, state_pos, init_state_feat, mem, init_mem):
+        return pack_state_args(
+            state_feat=state_feat,
+            state_pos=state_pos,
+            init_state_feat=init_state_feat,
+            mem=mem,
+            init_mem=init_mem,
+        )
+
+    @staticmethod
+    def _unpack_state(state_args):
+        return unpack_state_args(state_args)
 
     def set_downstream_head(
         self,
@@ -754,12 +778,18 @@ class ARCroco3DStereo(CroCoNet):
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
         init_mem = mem.clone()
-        return (feat, pos, shape), (
-            init_state_feat,
-            init_mem,
-            state_feat,
-            state_pos,
-            mem,
+        trend_hidden = torch.zeros_like(state_feat) if self.use_stable_propagation else None
+        init_trend_hidden = (
+            trend_hidden.clone() if trend_hidden is not None else None
+        )
+        return (feat, pos, shape), self._pack_state(
+            state_feat=state_feat,
+            state_pos=state_pos,
+            init_state_feat=init_state_feat,
+            mem=mem,
+            init_mem=init_mem,
+            trend_hidden=trend_hidden,
+            aux={"init_trend_hidden": init_trend_hidden},
         )
 
     def _forward_decoder_step(
@@ -774,6 +804,8 @@ class ARCroco3DStereo(CroCoNet):
         state_feat,
         state_pos,
         mem,
+        trend_hidden=None,
+        init_trend_hidden=None,
     ):
         if self.pose_head_flag:
             global_img_feat_i = self._get_img_level_feat(feat_i)
@@ -826,16 +858,30 @@ class ARCroco3DStereo(CroCoNet):
         else:
             update_mask = img_mask
         update_mask = update_mask[:, None, None].float()
-        state_feat = new_state_feat * update_mask + state_feat * (
-            1 - update_mask
-        )  # update global state
+        state_feat, trend_hidden = apply_state_update(
+            state_feat=state_feat,
+            candidate_state_feat=new_state_feat,
+            init_state_feat=init_state_feat,
+            update_mask=update_mask,
+            reset_mask=None,
+            use_stable_propagation=self.use_stable_propagation,
+            trend_hidden=trend_hidden,
+            init_trend_hidden=init_trend_hidden,
+            propagator=self.trend_propagator,
+        )
         mem = new_mem * update_mask + mem * (1 - update_mask)  # then update local state
         reset_mask = views[i]["reset"]
         if reset_mask is not None:
             reset_mask = reset_mask[:, None, None].float()
             state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
+            if trend_hidden is not None:
+                if init_trend_hidden is None:
+                    init_trend_hidden = torch.zeros_like(trend_hidden)
+                trend_hidden = (
+                    init_trend_hidden * reset_mask + trend_hidden * (1 - reset_mask)
+                )
             mem = init_mem * reset_mask + mem * (1 - reset_mask)
-        return res, (state_feat, mem)
+        return res, (state_feat, mem, trend_hidden)
 
     def _forward_impl(self, views, ret_state=False):
         shape, feat_ls, pos = self._encode_views(views)
@@ -844,7 +890,21 @@ class ARCroco3DStereo(CroCoNet):
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
         init_mem = mem.clone()
-        all_state_args = [(state_feat, state_pos, init_state_feat, mem, init_mem)]
+        trend_hidden = torch.zeros_like(state_feat) if self.use_stable_propagation else None
+        init_trend_hidden = (
+            trend_hidden.clone() if trend_hidden is not None else None
+        )
+        all_state_args = [
+            self._pack_state(
+                state_feat=state_feat,
+                state_pos=state_pos,
+                init_state_feat=init_state_feat,
+                mem=mem,
+                init_mem=init_mem,
+                trend_hidden=trend_hidden,
+                aux={"init_trend_hidden": init_trend_hidden},
+            )
+        ]
         ress = []
         for i in range(len(views)):
             feat_i = feat[i]
@@ -895,21 +955,42 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
-            )  # update global state
+            state_feat, trend_hidden = apply_state_update(
+                state_feat=state_feat,
+                candidate_state_feat=new_state_feat,
+                init_state_feat=init_state_feat,
+                update_mask=update_mask,
+                reset_mask=None,
+                use_stable_propagation=self.use_stable_propagation,
+                trend_hidden=trend_hidden,
+                init_trend_hidden=init_trend_hidden,
+                propagator=self.trend_propagator,
+            )
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state
             reset_mask = views[i]["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (
-                    1 - reset_mask
-                )
+                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
+                if trend_hidden is not None:
+                    if init_trend_hidden is None:
+                        init_trend_hidden = torch.zeros_like(trend_hidden)
+                    trend_hidden = (
+                        init_trend_hidden * reset_mask
+                        + trend_hidden * (1 - reset_mask)
+                    )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
-                (state_feat, state_pos, init_state_feat, mem, init_mem)
+                self._pack_state(
+                    state_feat=state_feat,
+                    state_pos=state_pos,
+                    init_state_feat=init_state_feat,
+                    mem=mem,
+                    init_mem=init_mem,
+                    trend_hidden=trend_hidden,
+                    aux={"init_trend_hidden": init_trend_hidden},
+                )
             )
         if ret_state:
             return ress, views, all_state_args
@@ -1053,8 +1134,22 @@ class ARCroco3DStereo(CroCoNet):
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
+                trend_hidden = (
+                    torch.zeros_like(state_feat) if self.use_stable_propagation else None
+                )
+                init_trend_hidden = (
+                    trend_hidden.clone() if trend_hidden is not None else None
+                )
                 all_state_args.append(
-                    (state_feat, state_pos, init_state_feat, mem, init_mem)
+                    self._pack_state(
+                        state_feat=state_feat,
+                        state_pos=state_pos,
+                        init_state_feat=init_state_feat,
+                        mem=mem,
+                        init_mem=init_mem,
+                        trend_hidden=trend_hidden,
+                        aux={"init_trend_hidden": init_trend_hidden},
+                    )
                 )
 
             if self.pose_head_flag:
@@ -1105,21 +1200,42 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
-            )  # update global state
+            state_feat, trend_hidden = apply_state_update(
+                state_feat=state_feat,
+                candidate_state_feat=new_state_feat,
+                init_state_feat=init_state_feat,
+                update_mask=update_mask,
+                reset_mask=None,
+                use_stable_propagation=self.use_stable_propagation,
+                trend_hidden=trend_hidden,
+                init_trend_hidden=init_trend_hidden,
+                propagator=self.trend_propagator,
+            )
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state
             reset_mask = view["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (
-                    1 - reset_mask
-                )
+                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
+                if trend_hidden is not None:
+                    if init_trend_hidden is None:
+                        init_trend_hidden = torch.zeros_like(trend_hidden)
+                    trend_hidden = (
+                        init_trend_hidden * reset_mask
+                        + trend_hidden * (1 - reset_mask)
+                    )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
-                (state_feat, state_pos, init_state_feat, mem, init_mem)
+                self._pack_state(
+                    state_feat=state_feat,
+                    state_pos=state_pos,
+                    init_state_feat=init_state_feat,
+                    mem=mem,
+                    init_mem=init_mem,
+                    trend_hidden=trend_hidden,
+                    aux={"init_trend_hidden": init_trend_hidden},
+                )
             )
         if ret_state:
             return ress, views, all_state_args
