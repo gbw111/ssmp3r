@@ -113,13 +113,16 @@ def loss_of_one_batch_tbptt(
     all_loss_details = {}
     with torch.cuda.amp.autocast(enabled=not inference):
         with torch.no_grad():
-            (feat, pos, shape), (
-                init_state_feat,
-                init_mem,
+            (feat, pos, shape), state_args = accelerator.unwrap_model(
+                model
+            )._forward_encoder(batch)
+            (
                 state_feat,
                 state_pos,
+                init_state_feat,
                 mem,
-            ) = accelerator.unwrap_model(model)._forward_encoder(batch)
+                init_mem,
+            ) = accelerator.unwrap_model(model)._unpack_state(state_args)
         feat = [f.detach() for f in feat]
         pos = [p.detach() for p in pos]
         shape = [s.detach() for s in shape]
@@ -252,7 +255,9 @@ def inference_step(view, state_args, model, device, verbose=True):
             view[name] = view[name].to(device, non_blocking=True)
 
     with torch.cuda.amp.autocast(enabled=False):
-        state_feat, state_pos, init_state_feat, mem, init_mem = state_args
+        state_feat, state_pos, init_state_feat, mem, init_mem = model._unpack_state(
+            state_args
+        )
         pred, _ = model.inference_step(
             view, state_feat, state_pos, init_state_feat, mem, init_mem
         )

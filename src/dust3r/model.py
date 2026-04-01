@@ -54,6 +54,26 @@ class ARCroco3DStereoOutput(ModelOutput):
     views: Optional[List[Any]] = None
 
 
+@dataclass
+class PersistentState:
+    """Structured persistent state container for recurrent CUT3R flow."""
+
+    state_feat: Any
+    state_pos: Any
+    init_state_feat: Any
+    mem: Any
+    init_mem: Any
+
+    def as_legacy_tuple(self):
+        return (
+            self.state_feat,
+            self.state_pos,
+            self.init_state_feat,
+            self.mem,
+            self.init_mem,
+        )
+
+
 def strip_module(state_dict):
     """
     Removes the 'module.' prefix from the keys of a state_dict.
@@ -479,6 +499,40 @@ class ARCroco3DStereo(CroCoNet):
         """No prediction head"""
         return
 
+    @staticmethod
+    def _pack_state(state_feat, state_pos, init_state_feat, mem, init_mem):
+        return PersistentState(
+            state_feat=state_feat,
+            state_pos=state_pos,
+            init_state_feat=init_state_feat,
+            mem=mem,
+            init_mem=init_mem,
+        )
+
+    @staticmethod
+    def _unpack_state(state_args):
+        if isinstance(state_args, PersistentState):
+            return (
+                state_args.state_feat,
+                state_args.state_pos,
+                state_args.init_state_feat,
+                state_args.mem,
+                state_args.init_mem,
+            )
+        if isinstance(state_args, dict):
+            return (
+                state_args["state_feat"],
+                state_args["state_pos"],
+                state_args["init_state_feat"],
+                state_args["mem"],
+                state_args["init_mem"],
+            )
+        if isinstance(state_args, (tuple, list)) and len(state_args) == 5:
+            return tuple(state_args)
+        raise TypeError(
+            "Unsupported state_args format. Expected PersistentState, dict, or 5-tuple/list."
+        )
+
     def set_downstream_head(
         self,
         output_mode,
@@ -754,12 +808,12 @@ class ARCroco3DStereo(CroCoNet):
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
         init_mem = mem.clone()
-        return (feat, pos, shape), (
-            init_state_feat,
-            init_mem,
-            state_feat,
-            state_pos,
-            mem,
+        return (feat, pos, shape), self._pack_state(
+            state_feat=state_feat,
+            state_pos=state_pos,
+            init_state_feat=init_state_feat,
+            mem=mem,
+            init_mem=init_mem,
         )
 
     def _forward_decoder_step(
@@ -844,7 +898,15 @@ class ARCroco3DStereo(CroCoNet):
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
         init_mem = mem.clone()
-        all_state_args = [(state_feat, state_pos, init_state_feat, mem, init_mem)]
+        all_state_args = [
+            self._pack_state(
+                state_feat=state_feat,
+                state_pos=state_pos,
+                init_state_feat=init_state_feat,
+                mem=mem,
+                init_mem=init_mem,
+            )
+        ]
         ress = []
         for i in range(len(views)):
             feat_i = feat[i]
@@ -909,7 +971,13 @@ class ARCroco3DStereo(CroCoNet):
                 )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
-                (state_feat, state_pos, init_state_feat, mem, init_mem)
+                self._pack_state(
+                    state_feat=state_feat,
+                    state_pos=state_pos,
+                    init_state_feat=init_state_feat,
+                    mem=mem,
+                    init_mem=init_mem,
+                )
             )
         if ret_state:
             return ress, views, all_state_args
@@ -1054,7 +1122,13 @@ class ARCroco3DStereo(CroCoNet):
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
                 all_state_args.append(
-                    (state_feat, state_pos, init_state_feat, mem, init_mem)
+                    self._pack_state(
+                        state_feat=state_feat,
+                        state_pos=state_pos,
+                        init_state_feat=init_state_feat,
+                        mem=mem,
+                        init_mem=init_mem,
+                    )
                 )
 
             if self.pose_head_flag:
@@ -1119,7 +1193,13 @@ class ARCroco3DStereo(CroCoNet):
                 )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
-                (state_feat, state_pos, init_state_feat, mem, init_mem)
+                self._pack_state(
+                    state_feat=state_feat,
+                    state_pos=state_pos,
+                    init_state_feat=init_state_feat,
+                    mem=mem,
+                    init_mem=init_mem,
+                )
             )
         if ret_state:
             return ress, views, all_state_args
