@@ -4,6 +4,7 @@ from dust3r.utils.device import to_cpu, collate_with_cat
 from dust3r.utils.misc import invalid_to_nans
 from dust3r.utils.geometry import depthmap_to_pts3d, geotrf
 from dust3r.model import ARCroco3DStereo
+from dust3r.state_api import unpack_state_args
 from accelerate import Accelerator
 import re
 
@@ -122,7 +123,7 @@ def loss_of_one_batch_tbptt(
                 init_state_feat,
                 mem,
                 init_mem,
-            ) = accelerator.unwrap_model(model)._unpack_state(state_args)
+            ) = unpack_state_args(state_args)
         feat = [f.detach() for f in feat]
         pos = [p.detach() for p in pos]
         shape = [s.detach() for s in shape]
@@ -255,7 +256,7 @@ def inference_step(view, state_args, model, device, verbose=True):
             view[name] = view[name].to(device, non_blocking=True)
 
     with torch.cuda.amp.autocast(enabled=False):
-        state_feat, state_pos, init_state_feat, mem, init_mem = model._unpack_state(
+        state_feat, state_pos, init_state_feat, mem, init_mem = unpack_state_args(
             state_args
         )
         pred, _ = model.inference_step(

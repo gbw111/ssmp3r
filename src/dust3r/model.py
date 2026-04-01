@@ -26,6 +26,7 @@ from dust3r.utils.misc import (
 from dust3r.heads import head_factory
 from dust3r.utils.camera import PoseEncoder
 from dust3r.patch_embed import get_patch_embed
+from dust3r.state_api import PersistentState, pack_state_args, unpack_state_args
 import dust3r.utils.path_to_croco  # noqa: F401
 from models.croco import CroCoNet, CrocoConfig  # noqa
 from dust3r.blocks import (
@@ -52,26 +53,6 @@ class ARCroco3DStereoOutput(ModelOutput):
 
     ress: Optional[List[Any]] = None
     views: Optional[List[Any]] = None
-
-
-@dataclass
-class PersistentState:
-    """Structured persistent state container for recurrent CUT3R flow."""
-
-    state_feat: Any
-    state_pos: Any
-    init_state_feat: Any
-    mem: Any
-    init_mem: Any
-
-    def as_legacy_tuple(self):
-        return (
-            self.state_feat,
-            self.state_pos,
-            self.init_state_feat,
-            self.mem,
-            self.init_mem,
-        )
 
 
 def strip_module(state_dict):
@@ -501,7 +482,7 @@ class ARCroco3DStereo(CroCoNet):
 
     @staticmethod
     def _pack_state(state_feat, state_pos, init_state_feat, mem, init_mem):
-        return PersistentState(
+        return pack_state_args(
             state_feat=state_feat,
             state_pos=state_pos,
             init_state_feat=init_state_feat,
@@ -511,27 +492,7 @@ class ARCroco3DStereo(CroCoNet):
 
     @staticmethod
     def _unpack_state(state_args):
-        if isinstance(state_args, PersistentState):
-            return (
-                state_args.state_feat,
-                state_args.state_pos,
-                state_args.init_state_feat,
-                state_args.mem,
-                state_args.init_mem,
-            )
-        if isinstance(state_args, dict):
-            return (
-                state_args["state_feat"],
-                state_args["state_pos"],
-                state_args["init_state_feat"],
-                state_args["mem"],
-                state_args["init_mem"],
-            )
-        if isinstance(state_args, (tuple, list)) and len(state_args) == 5:
-            return tuple(state_args)
-        raise TypeError(
-            "Unsupported state_args format. Expected PersistentState, dict, or 5-tuple/list."
-        )
+        return unpack_state_args(state_args)
 
     def set_downstream_head(
         self,
