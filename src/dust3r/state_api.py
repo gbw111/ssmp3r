@@ -51,20 +51,34 @@ def pack_state_args(
 
 
 def unpack_state_args(state_args: Any) -> Tuple[Any, Any, Any, Any, Any]:
+    return to_persistent_state(state_args).as_legacy_tuple()
+
+
+def to_persistent_state(state_args: Any) -> PersistentState:
     if isinstance(state_args, PersistentState):
-        return state_args.as_legacy_tuple()
+        return state_args
 
     if isinstance(state_args, dict):
-        return (
-            state_args["state_feat"],
-            state_args["state_pos"],
-            state_args["init_state_feat"],
-            state_args["mem"],
-            state_args["init_mem"],
+        optional_keys = [
+            "trend_feat",
+            "residual_feat",
+            "trend_hidden",
+            "residual_hidden",
+            "eligibility",
+            "aux",
+        ]
+        optional_values = {k: state_args.get(k) for k in optional_keys if k in state_args}
+        return PersistentState(
+            state_feat=state_args["state_feat"],
+            state_pos=state_args["state_pos"],
+            init_state_feat=state_args["init_state_feat"],
+            mem=state_args["mem"],
+            init_mem=state_args["init_mem"],
+            **optional_values,
         )
 
     if isinstance(state_args, (tuple, list)) and len(state_args) == 5:
-        return tuple(state_args)
+        return pack_state_args(*state_args)
 
     raise TypeError(
         "Unsupported state_args format. Expected PersistentState, dict, or 5-tuple/list."

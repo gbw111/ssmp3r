@@ -4,7 +4,7 @@ from dust3r.utils.device import to_cpu, collate_with_cat
 from dust3r.utils.misc import invalid_to_nans
 from dust3r.utils.geometry import depthmap_to_pts3d, geotrf
 from dust3r.model import ARCroco3DStereo
-from dust3r.state_api import unpack_state_args
+from dust3r.state_api import to_persistent_state, unpack_state_args
 from accelerate import Accelerator
 import re
 
@@ -117,18 +117,25 @@ def loss_of_one_batch_tbptt(
             (feat, pos, shape), state_args = accelerator.unwrap_model(
                 model
             )._forward_encoder(batch)
+            state_obj = to_persistent_state(state_args)
             (
                 state_feat,
                 state_pos,
                 init_state_feat,
                 mem,
                 init_mem,
-            ) = unpack_state_args(state_args)
+            ) = state_obj.as_legacy_tuple()
+            trend_hidden = state_obj.trend_hidden
+            init_trend_hidden = (state_obj.aux or {}).get("init_trend_hidden")
         feat = [f.detach() for f in feat]
         pos = [p.detach() for p in pos]
         shape = [s.detach() for s in shape]
         init_state_feat = init_state_feat.detach()
         init_mem = init_mem.detach()
+        if trend_hidden is not None:
+            trend_hidden = trend_hidden.detach()
+        if init_trend_hidden is not None:
+            init_trend_hidden = init_trend_hidden.detach()
 
         for chunk_id in range((len(batch) - 1) // chunk_size + 1):
             preds = []
@@ -142,7 +149,7 @@ def loss_of_one_batch_tbptt(
                         i = chunk_id * chunk_size + in_chunk_idx
                         if i >= len(batch):
                             break
-                        res, (state_feat, mem) = accelerator.unwrap_model(
+                        res, (state_feat, mem, trend_hidden) = accelerator.unwrap_model(
                             model
                         )._forward_decoder_step(
                             batch,
@@ -155,6 +162,8 @@ def loss_of_one_batch_tbptt(
                             state_feat=state_feat,
                             state_pos=state_pos,
                             mem=mem,
+                            trend_hidden=trend_hidden,
+                            init_trend_hidden=init_trend_hidden,
                         )
                         preds.append(res)
                         all_preds.append({k: v.detach() for k, v in res.items()})
@@ -175,7 +184,7 @@ def loss_of_one_batch_tbptt(
                     i = chunk_id * chunk_size + in_chunk_idx
                     if i >= len(batch):
                         break
-                    res, (state_feat, mem) = accelerator.unwrap_model(
+                    res, (state_feat, mem, trend_hidden) = accelerator.unwrap_model(
                         model
                     )._forward_decoder_step(
                         batch,
@@ -188,6 +197,8 @@ def loss_of_one_batch_tbptt(
                         state_feat=state_feat,
                         state_pos=state_pos,
                         mem=mem,
+                        trend_hidden=trend_hidden,
+                        init_trend_hidden=init_trend_hidden,
                     )
                     preds.append(res)
                     all_preds.append({k: v.detach() for k, v in res.items()})
