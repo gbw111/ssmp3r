@@ -61,6 +61,16 @@ def _dual_step(state_obj, use_stable_propagation):
         residual_hidden=state_obj.residual_hidden,
     )
     fused_next = fusion(trend_feat, residual_feat)
+    stats = {
+        "alpha_mean": float(alpha.mean().detach()),
+        "alpha_min": float(alpha.min().detach()),
+        "alpha_max": float(alpha.max().detach()),
+        "trend_norm": float(trend_feat.norm().detach()),
+        "residual_norm": float(residual_feat.norm().detach()),
+        "delta_tr_norm": float(delta_tr.norm().detach()),
+        "delta_res_norm": float(delta_res.norm().detach()),
+        "fusion_weight": float(torch.sigmoid(fusion.residual_weight).item()),
+    }
     return pack_state_args(
         state_feat=fused_next,
         state_pos=state_obj.state_pos,
@@ -72,32 +82,100 @@ def _dual_step(state_obj, use_stable_propagation):
         trend_hidden=trend_hidden,
         residual_hidden=residual_hidden,
         aux=state_obj.aux,
+    ), stats
+
+
+def _single_state_two_step(use_stable_propagation):
+    state = _make_state()
+    state = to_persistent_state(state)
+    trend_propagator = TrendPropagator(state.state_feat.shape[-1])
+    trend_hidden_init = (
+        torch.zeros_like(state.state_feat) if use_stable_propagation else None
+    )
+    init_trend_hidden = (
+        torch.zeros_like(state.state_feat) if use_stable_propagation else None
+    )
+    update_mask = torch.ones(state.state_feat.shape[0], 1, 1)
+    reset_mask = torch.zeros_like(update_mask)
+
+    candidate_1 = torch.randn_like(state.state_feat)
+    state_feat_1, trend_hidden_1 = apply_state_update(
+        state_feat=state.state_feat,
+        candidate_state_feat=candidate_1,
+        init_state_feat=state.init_state_feat,
+        update_mask=update_mask,
+        reset_mask=reset_mask,
+        use_stable_propagation=use_stable_propagation,
+        trend_hidden=trend_hidden_init,
+        init_trend_hidden=init_trend_hidden,
+        propagator=trend_propagator if use_stable_propagation else None,
     )
 
+    candidate_2 = torch.randn_like(state_feat_1)
+    state_feat_2, trend_hidden_2 = apply_state_update(
+        state_feat=state_feat_1,
+        candidate_state_feat=candidate_2,
+        init_state_feat=state.init_state_feat,
+        update_mask=update_mask,
+        reset_mask=reset_mask,
+        use_stable_propagation=use_stable_propagation,
+        trend_hidden=trend_hidden_1,
+        init_trend_hidden=init_trend_hidden,
+        propagator=trend_propagator if use_stable_propagation else None,
+    )
 
-def test_dual_state_two_step_off_and_on():
+    assert state_feat_2.shape == state.state_feat.shape
+    if use_stable_propagation:
+        assert trend_hidden_1 is not None and trend_hidden_2 is not None
+    else:
+        assert trend_hidden_1 is None and trend_hidden_2 is None
+
+
+def test_phase2_recurrent_toggle_matrix():
+    torch.manual_seed(42)
+    # dual off / stable off
+    _single_state_two_step(use_stable_propagation=False)
+    # dual off / stable on
+    _single_state_two_step(use_stable_propagation=True)
+
+    # dual on / stable off
     state_0 = _make_state()
-
-    state_1_off = _dual_step(state_0, use_stable_propagation=False)
-    state_2_off = _dual_step(state_1_off, use_stable_propagation=False)
+    state_1_off, stats_off_1 = _dual_step(state_0, use_stable_propagation=False)
+    state_2_off, stats_off_2 = _dual_step(state_1_off, use_stable_propagation=False)
     assert state_2_off.trend_feat is not None
     assert state_2_off.residual_feat is not None
     assert state_2_off.state_feat.shape == state_0.state_feat.shape
 
-    state_1_on = _dual_step(state_0, use_stable_propagation=True)
-    state_2_on = _dual_step(state_1_on, use_stable_propagation=True)
+    # dual on / stable on
+    state_1_on, stats_on_1 = _dual_step(state_0, use_stable_propagation=True)
+    state_2_on, stats_on_2 = _dual_step(state_1_on, use_stable_propagation=True)
     assert state_2_on.trend_hidden is not None
     assert state_2_on.residual_hidden is not None
     assert state_2_on.state_feat.shape == state_0.state_feat.shape
 
+    # dual-state activity sanity assertions (dual on)
+    assert not torch.allclose(state_1_on.trend_feat, state_0.trend_feat)
+    assert not torch.allclose(state_1_on.residual_feat, state_0.residual_feat)
+    assert stats_on_2["delta_tr_norm"] > 0.0
+    assert stats_on_2["delta_res_norm"] > 0.0
+    assert stats_on_2["alpha_min"] > 0.0
+    assert stats_on_2["alpha_max"] < 1.0
+    assert stats_on_2["alpha_max"] - stats_on_2["alpha_min"] > 1e-5
+
+    # Keep stats visible in test logs for quick debugging/PR reporting.
+    print("dual_on_stable_off_step1_stats:", stats_off_1)
+    print("dual_on_stable_off_step2_stats:", stats_off_2)
+    print("dual_on_stable_on_step1_stats:", stats_on_1)
+    print("dual_on_stable_on_step2_stats:", stats_on_2)
+
 
 def test_no_consolidation_fields_used():
     state = _make_state()
-    state_next = _dual_step(state, use_stable_propagation=True)
+    state_next, _ = _dual_step(state, use_stable_propagation=True)
     assert state_next.eligibility is None
 
 
 if __name__ == "__main__":
-    test_dual_state_two_step_off_and_on()
+    test_phase2_recurrent_toggle_matrix()
     test_no_consolidation_fields_used()
     print("dual_state_factorization_smoke: ok")
