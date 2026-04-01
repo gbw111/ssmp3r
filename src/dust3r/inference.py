@@ -126,7 +126,13 @@ def loss_of_one_batch_tbptt(
                 init_mem,
             ) = state_obj.as_legacy_tuple()
             trend_hidden = state_obj.trend_hidden
+            trend_feat = state_obj.trend_feat
+            residual_feat = state_obj.residual_feat
+            residual_hidden = state_obj.residual_hidden
             init_trend_hidden = (state_obj.aux or {}).get("init_trend_hidden")
+            init_trend_feat = (state_obj.aux or {}).get("init_trend_feat")
+            init_residual_feat = (state_obj.aux or {}).get("init_residual_feat")
+            init_residual_hidden = (state_obj.aux or {}).get("init_residual_hidden")
         feat = [f.detach() for f in feat]
         pos = [p.detach() for p in pos]
         shape = [s.detach() for s in shape]
@@ -136,6 +142,18 @@ def loss_of_one_batch_tbptt(
             trend_hidden = trend_hidden.detach()
         if init_trend_hidden is not None:
             init_trend_hidden = init_trend_hidden.detach()
+        if trend_feat is not None:
+            trend_feat = trend_feat.detach()
+        if residual_feat is not None:
+            residual_feat = residual_feat.detach()
+        if residual_hidden is not None:
+            residual_hidden = residual_hidden.detach()
+        if init_trend_feat is not None:
+            init_trend_feat = init_trend_feat.detach()
+        if init_residual_feat is not None:
+            init_residual_feat = init_residual_feat.detach()
+        if init_residual_hidden is not None:
+            init_residual_hidden = init_residual_hidden.detach()
 
         for chunk_id in range((len(batch) - 1) // chunk_size + 1):
             preds = []
@@ -143,15 +161,31 @@ def loss_of_one_batch_tbptt(
             state_feat = state_feat.detach()
             state_pos = state_pos.detach()
             mem = mem.detach()
+            if trend_feat is not None:
+                trend_feat = trend_feat.detach()
+            if residual_feat is not None:
+                residual_feat = residual_feat.detach()
+            if trend_hidden is not None:
+                trend_hidden = trend_hidden.detach()
+            if residual_hidden is not None:
+                residual_hidden = residual_hidden.detach()
             if chunk_id < ((len(batch) - 1) // chunk_size + 1) - 4:
                 with torch.no_grad():
                     for in_chunk_idx in range(chunk_size):
                         i = chunk_id * chunk_size + in_chunk_idx
                         if i >= len(batch):
                             break
-                        res, (state_feat, mem, trend_hidden) = accelerator.unwrap_model(
-                            model
-                        )._forward_decoder_step(
+                        (
+                            res,
+                            (
+                                state_feat,
+                                mem,
+                                trend_feat,
+                                residual_feat,
+                                trend_hidden,
+                                residual_hidden,
+                            ),
+                        ) = accelerator.unwrap_model(model)._forward_decoder_step(
                             batch,
                             i,
                             feat_i=feat[i],
@@ -162,8 +196,14 @@ def loss_of_one_batch_tbptt(
                             state_feat=state_feat,
                             state_pos=state_pos,
                             mem=mem,
+                            trend_feat=trend_feat,
+                            residual_feat=residual_feat,
                             trend_hidden=trend_hidden,
+                            residual_hidden=residual_hidden,
+                            init_trend_feat=init_trend_feat,
+                            init_residual_feat=init_residual_feat,
                             init_trend_hidden=init_trend_hidden,
+                            init_residual_hidden=init_residual_hidden,
                         )
                         preds.append(res)
                         all_preds.append({k: v.detach() for k, v in res.items()})
@@ -184,9 +224,17 @@ def loss_of_one_batch_tbptt(
                     i = chunk_id * chunk_size + in_chunk_idx
                     if i >= len(batch):
                         break
-                    res, (state_feat, mem, trend_hidden) = accelerator.unwrap_model(
-                        model
-                    )._forward_decoder_step(
+                    (
+                        res,
+                        (
+                            state_feat,
+                            mem,
+                            trend_feat,
+                            residual_feat,
+                            trend_hidden,
+                            residual_hidden,
+                        ),
+                    ) = accelerator.unwrap_model(model)._forward_decoder_step(
                         batch,
                         i,
                         feat_i=feat[i],
@@ -197,8 +245,14 @@ def loss_of_one_batch_tbptt(
                         state_feat=state_feat,
                         state_pos=state_pos,
                         mem=mem,
+                        trend_feat=trend_feat,
+                        residual_feat=residual_feat,
                         trend_hidden=trend_hidden,
+                        residual_hidden=residual_hidden,
+                        init_trend_feat=init_trend_feat,
+                        init_residual_feat=init_residual_feat,
                         init_trend_hidden=init_trend_hidden,
+                        init_residual_hidden=init_residual_hidden,
                     )
                     preds.append(res)
                     all_preds.append({k: v.detach() for k, v in res.items()})

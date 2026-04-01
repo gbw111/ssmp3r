@@ -28,6 +28,11 @@ from dust3r.utils.camera import PoseEncoder
 from dust3r.patch_embed import get_patch_embed
 from dust3r.state_api import PersistentState, pack_state_args, unpack_state_args
 from dust3r.stable_propagation import TrendPropagator, apply_state_update
+from dust3r.dual_state_factorization import (
+    StateFusion,
+    TemporalFactorizer,
+    ResidualUpdater,
+)
 import dust3r.utils.path_to_croco  # noqa: F401
 from models.croco import CroCoNet, CrocoConfig  # noqa
 from dust3r.blocks import (
@@ -117,6 +122,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         pose_conf_head=False,
         pose_head=False,
         use_stable_propagation=False,
+        use_dual_state=False,
         **croco_kwargs,
     ):
         super().__init__()
@@ -138,6 +144,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.pose_conf_head = pose_conf_head
         self.pose_head = pose_head
         self.use_stable_propagation = use_stable_propagation
+        self.use_dual_state = use_dual_state
         self.croco_kwargs = croco_kwargs
 
 
@@ -309,10 +316,20 @@ class ARCroco3DStereo(CroCoNet):
             **self.croco_args,
         )
         self.use_stable_propagation = config.use_stable_propagation
+        self.use_dual_state = config.use_dual_state
         self.trend_propagator = (
             TrendPropagator(self.dec_embed_dim)
             if self.use_stable_propagation
             else None
+        )
+        self.state_fusion = (
+            StateFusion(self.dec_embed_dim) if self.use_dual_state else None
+        )
+        self.temporal_factorizer = (
+            TemporalFactorizer(self.dec_embed_dim) if self.use_dual_state else None
+        )
+        self.residual_updater = (
+            ResidualUpdater(self.dec_embed_dim) if self.use_dual_state else None
         )
         self.set_freeze(config.freeze)
 
@@ -490,13 +507,14 @@ class ARCroco3DStereo(CroCoNet):
         return
 
     @staticmethod
-    def _pack_state(state_feat, state_pos, init_state_feat, mem, init_mem):
+    def _pack_state(state_feat, state_pos, init_state_feat, mem, init_mem, **kwargs):
         return pack_state_args(
             state_feat=state_feat,
             state_pos=state_pos,
             init_state_feat=init_state_feat,
             mem=mem,
             init_mem=init_mem,
+            **kwargs,
         )
 
     @staticmethod
@@ -771,10 +789,19 @@ class ARCroco3DStereo(CroCoNet):
     def _get_img_level_feat(self, feat):
         return torch.mean(feat, dim=1, keepdim=True)
 
+    def _build_fused_state(self, trend_feat, residual_feat):
+        if self.use_dual_state:
+            return self.state_fusion(trend_feat, residual_feat)
+        return trend_feat
+
     def _forward_encoder(self, views):
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
-        state_feat, state_pos = self._init_state(feat[0], pos[0])
+        trend_feat, state_pos = self._init_state(feat[0], pos[0])
+        residual_feat = (
+            torch.zeros_like(trend_feat) if self.use_dual_state else None
+        )
+        state_feat = self._build_fused_state(trend_feat, residual_feat)
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
         init_mem = mem.clone()
@@ -782,14 +809,32 @@ class ARCroco3DStereo(CroCoNet):
         init_trend_hidden = (
             trend_hidden.clone() if trend_hidden is not None else None
         )
+        residual_hidden = (
+            torch.zeros_like(state_feat) if self.use_dual_state else None
+        )
+        init_residual_hidden = (
+            residual_hidden.clone() if residual_hidden is not None else None
+        )
+        init_trend_feat = trend_feat.clone()
+        init_residual_feat = (
+            residual_feat.clone() if residual_feat is not None else None
+        )
         return (feat, pos, shape), self._pack_state(
             state_feat=state_feat,
             state_pos=state_pos,
             init_state_feat=init_state_feat,
             mem=mem,
             init_mem=init_mem,
+            trend_feat=trend_feat,
+            residual_feat=residual_feat,
             trend_hidden=trend_hidden,
-            aux={"init_trend_hidden": init_trend_hidden},
+            residual_hidden=residual_hidden,
+            aux={
+                "init_trend_hidden": init_trend_hidden,
+                "init_residual_hidden": init_residual_hidden,
+                "init_trend_feat": init_trend_feat,
+                "init_residual_feat": init_residual_feat,
+            },
         )
 
     def _forward_decoder_step(
@@ -804,8 +849,14 @@ class ARCroco3DStereo(CroCoNet):
         state_feat,
         state_pos,
         mem,
+        trend_feat=None,
+        residual_feat=None,
         trend_hidden=None,
+        residual_hidden=None,
+        init_trend_feat=None,
+        init_residual_feat=None,
         init_trend_hidden=None,
+        init_residual_hidden=None,
     ):
         if self.pose_head_flag:
             global_img_feat_i = self._get_img_level_feat(feat_i)
@@ -821,9 +872,14 @@ class ARCroco3DStereo(CroCoNet):
             pose_feat_i = None
             pose_pos_i = None
         
+        state_input = (
+            self._build_fused_state(trend_feat, residual_feat)
+            if self.use_dual_state
+            else state_feat
+        )
         # 得到更新后的 state 以及融合后的 img_feature
         new_state_feat, dec = self._recurrent_rollout(
-            state_feat,
+            state_input,
             state_pos,
             feat_i,
             pos_i,
@@ -858,41 +914,114 @@ class ARCroco3DStereo(CroCoNet):
         else:
             update_mask = img_mask
         update_mask = update_mask[:, None, None].float()
-        state_feat, trend_hidden = apply_state_update(
-            state_feat=state_feat,
-            candidate_state_feat=new_state_feat,
-            init_state_feat=init_state_feat,
-            update_mask=update_mask,
-            reset_mask=None,
-            use_stable_propagation=self.use_stable_propagation,
-            trend_hidden=trend_hidden,
-            init_trend_hidden=init_trend_hidden,
-            propagator=self.trend_propagator,
-        )
+        if self.use_dual_state:
+            fused_state = self._build_fused_state(trend_feat, residual_feat)
+            delta = new_state_feat - fused_state
+            delta_tr, delta_res, _ = self.temporal_factorizer(delta)
+            trend_candidate = trend_feat + delta_tr
+            trend_feat, trend_hidden = apply_state_update(
+                state_feat=trend_feat,
+                candidate_state_feat=trend_candidate,
+                init_state_feat=init_trend_feat,
+                update_mask=update_mask,
+                reset_mask=None,
+                use_stable_propagation=self.use_stable_propagation,
+                trend_hidden=trend_hidden,
+                init_trend_hidden=init_trend_hidden,
+                propagator=self.trend_propagator,
+            )
+            new_residual_feat, new_residual_hidden = self.residual_updater(
+                residual_feat=residual_feat,
+                delta_res=delta_res,
+                residual_hidden=residual_hidden,
+            )
+            if residual_hidden is None:
+                residual_hidden = torch.zeros_like(new_residual_hidden)
+            residual_feat = (
+                new_residual_feat * update_mask + residual_feat * (1 - update_mask)
+            )
+            residual_hidden = (
+                new_residual_hidden * update_mask
+                + residual_hidden * (1 - update_mask)
+            )
+            state_feat = self._build_fused_state(trend_feat, residual_feat)
+        else:
+            state_feat, trend_hidden = apply_state_update(
+                state_feat=state_feat,
+                candidate_state_feat=new_state_feat,
+                init_state_feat=init_state_feat,
+                update_mask=update_mask,
+                reset_mask=None,
+                use_stable_propagation=self.use_stable_propagation,
+                trend_hidden=trend_hidden,
+                init_trend_hidden=init_trend_hidden,
+                propagator=self.trend_propagator,
+            )
         mem = new_mem * update_mask + mem * (1 - update_mask)  # then update local state
         reset_mask = views[i]["reset"]
         if reset_mask is not None:
             reset_mask = reset_mask[:, None, None].float()
-            state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
-            if trend_hidden is not None:
-                if init_trend_hidden is None:
-                    init_trend_hidden = torch.zeros_like(trend_hidden)
-                trend_hidden = (
-                    init_trend_hidden * reset_mask + trend_hidden * (1 - reset_mask)
+            if self.use_dual_state:
+                trend_feat = init_trend_feat * reset_mask + trend_feat * (1 - reset_mask)
+                residual_feat = (
+                    init_residual_feat * reset_mask + residual_feat * (1 - reset_mask)
                 )
+                if trend_hidden is not None:
+                    if init_trend_hidden is None:
+                        init_trend_hidden = torch.zeros_like(trend_hidden)
+                    trend_hidden = (
+                        init_trend_hidden * reset_mask + trend_hidden * (1 - reset_mask)
+                    )
+                if residual_hidden is not None:
+                    if init_residual_hidden is None:
+                        init_residual_hidden = torch.zeros_like(residual_hidden)
+                    residual_hidden = (
+                        init_residual_hidden * reset_mask
+                        + residual_hidden * (1 - reset_mask)
+                    )
+                state_feat = self._build_fused_state(trend_feat, residual_feat)
+            else:
+                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
+                if trend_hidden is not None:
+                    if init_trend_hidden is None:
+                        init_trend_hidden = torch.zeros_like(trend_hidden)
+                    trend_hidden = (
+                        init_trend_hidden * reset_mask + trend_hidden * (1 - reset_mask)
+                    )
             mem = init_mem * reset_mask + mem * (1 - reset_mask)
-        return res, (state_feat, mem, trend_hidden)
+        return res, (
+            state_feat,
+            mem,
+            trend_feat,
+            residual_feat,
+            trend_hidden,
+            residual_hidden,
+        )
 
     def _forward_impl(self, views, ret_state=False):
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
-        state_feat, state_pos = self._init_state(feat[0], pos[0])
+        trend_feat, state_pos = self._init_state(feat[0], pos[0])
+        residual_feat = (
+            torch.zeros_like(trend_feat) if self.use_dual_state else None
+        )
+        state_feat = self._build_fused_state(trend_feat, residual_feat)
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
         init_mem = mem.clone()
         trend_hidden = torch.zeros_like(state_feat) if self.use_stable_propagation else None
         init_trend_hidden = (
             trend_hidden.clone() if trend_hidden is not None else None
+        )
+        residual_hidden = (
+            torch.zeros_like(state_feat) if self.use_dual_state else None
+        )
+        init_residual_hidden = (
+            residual_hidden.clone() if residual_hidden is not None else None
+        )
+        init_trend_feat = trend_feat.clone()
+        init_residual_feat = (
+            residual_feat.clone() if residual_feat is not None else None
         )
         all_state_args = [
             self._pack_state(
@@ -901,8 +1030,16 @@ class ARCroco3DStereo(CroCoNet):
                 init_state_feat=init_state_feat,
                 mem=mem,
                 init_mem=init_mem,
+                trend_feat=trend_feat,
+                residual_feat=residual_feat,
                 trend_hidden=trend_hidden,
-                aux={"init_trend_hidden": init_trend_hidden},
+                residual_hidden=residual_hidden,
+                aux={
+                    "init_trend_hidden": init_trend_hidden,
+                    "init_residual_hidden": init_residual_hidden,
+                    "init_trend_feat": init_trend_feat,
+                    "init_residual_feat": init_residual_feat,
+                },
             )
         ]
         ress = []
@@ -921,8 +1058,13 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 pose_feat_i = None
                 pose_pos_i = None
+            state_input = (
+                self._build_fused_state(trend_feat, residual_feat)
+                if self.use_dual_state
+                else state_feat
+            )
             new_state_feat, dec = self._recurrent_rollout(
-                state_feat,
+                state_input,
                 state_pos,
                 feat_i,
                 pos_i,
@@ -955,31 +1097,88 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat, trend_hidden = apply_state_update(
-                state_feat=state_feat,
-                candidate_state_feat=new_state_feat,
-                init_state_feat=init_state_feat,
-                update_mask=update_mask,
-                reset_mask=None,
-                use_stable_propagation=self.use_stable_propagation,
-                trend_hidden=trend_hidden,
-                init_trend_hidden=init_trend_hidden,
-                propagator=self.trend_propagator,
-            )
+            if self.use_dual_state:
+                fused_state = self._build_fused_state(trend_feat, residual_feat)
+                delta = new_state_feat - fused_state
+                delta_tr, delta_res, _ = self.temporal_factorizer(delta)
+                trend_candidate = trend_feat + delta_tr
+                trend_feat, trend_hidden = apply_state_update(
+                    state_feat=trend_feat,
+                    candidate_state_feat=trend_candidate,
+                    init_state_feat=init_trend_feat,
+                    update_mask=update_mask,
+                    reset_mask=None,
+                    use_stable_propagation=self.use_stable_propagation,
+                    trend_hidden=trend_hidden,
+                    init_trend_hidden=init_trend_hidden,
+                    propagator=self.trend_propagator,
+                )
+                new_residual_feat, new_residual_hidden = self.residual_updater(
+                    residual_feat=residual_feat,
+                    delta_res=delta_res,
+                    residual_hidden=residual_hidden,
+                )
+                if residual_hidden is None:
+                    residual_hidden = torch.zeros_like(new_residual_hidden)
+                residual_feat = (
+                    new_residual_feat * update_mask + residual_feat * (1 - update_mask)
+                )
+                residual_hidden = (
+                    new_residual_hidden * update_mask
+                    + residual_hidden * (1 - update_mask)
+                )
+                state_feat = self._build_fused_state(trend_feat, residual_feat)
+            else:
+                state_feat, trend_hidden = apply_state_update(
+                    state_feat=state_feat,
+                    candidate_state_feat=new_state_feat,
+                    init_state_feat=init_state_feat,
+                    update_mask=update_mask,
+                    reset_mask=None,
+                    use_stable_propagation=self.use_stable_propagation,
+                    trend_hidden=trend_hidden,
+                    init_trend_hidden=init_trend_hidden,
+                    propagator=self.trend_propagator,
+                )
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state
             reset_mask = views[i]["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
-                if trend_hidden is not None:
-                    if init_trend_hidden is None:
-                        init_trend_hidden = torch.zeros_like(trend_hidden)
-                    trend_hidden = (
-                        init_trend_hidden * reset_mask
-                        + trend_hidden * (1 - reset_mask)
+                if self.use_dual_state:
+                    trend_feat = (
+                        init_trend_feat * reset_mask + trend_feat * (1 - reset_mask)
                     )
+                    residual_feat = (
+                        init_residual_feat * reset_mask + residual_feat * (1 - reset_mask)
+                    )
+                    if trend_hidden is not None:
+                        if init_trend_hidden is None:
+                            init_trend_hidden = torch.zeros_like(trend_hidden)
+                        trend_hidden = (
+                            init_trend_hidden * reset_mask
+                            + trend_hidden * (1 - reset_mask)
+                        )
+                    if residual_hidden is not None:
+                        if init_residual_hidden is None:
+                            init_residual_hidden = torch.zeros_like(residual_hidden)
+                        residual_hidden = (
+                            init_residual_hidden * reset_mask
+                            + residual_hidden * (1 - reset_mask)
+                        )
+                    state_feat = self._build_fused_state(trend_feat, residual_feat)
+                else:
+                    state_feat = init_state_feat * reset_mask + state_feat * (
+                        1 - reset_mask
+                    )
+                    if trend_hidden is not None:
+                        if init_trend_hidden is None:
+                            init_trend_hidden = torch.zeros_like(trend_hidden)
+                        trend_hidden = (
+                            init_trend_hidden * reset_mask
+                            + trend_hidden * (1 - reset_mask)
+                        )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
                 self._pack_state(
@@ -988,8 +1187,16 @@ class ARCroco3DStereo(CroCoNet):
                     init_state_feat=init_state_feat,
                     mem=mem,
                     init_mem=init_mem,
+                    trend_feat=trend_feat if self.use_dual_state else None,
+                    residual_feat=residual_feat if self.use_dual_state else None,
                     trend_hidden=trend_hidden,
-                    aux={"init_trend_hidden": init_trend_hidden},
+                    residual_hidden=residual_hidden if self.use_dual_state else None,
+                    aux={
+                        "init_trend_hidden": init_trend_hidden,
+                        "init_residual_hidden": init_residual_hidden,
+                        "init_trend_feat": init_trend_feat,
+                        "init_residual_feat": init_residual_feat,
+                    },
                 )
             )
         if ret_state:
@@ -1130,7 +1337,11 @@ class ARCroco3DStereo(CroCoNet):
                 raise NotImplementedError
 
             if i == 0:
-                state_feat, state_pos = self._init_state(feat_i, pos_i)
+                trend_feat, state_pos = self._init_state(feat_i, pos_i)
+                residual_feat = (
+                    torch.zeros_like(trend_feat) if self.use_dual_state else None
+                )
+                state_feat = self._build_fused_state(trend_feat, residual_feat)
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
@@ -1140,6 +1351,16 @@ class ARCroco3DStereo(CroCoNet):
                 init_trend_hidden = (
                     trend_hidden.clone() if trend_hidden is not None else None
                 )
+                residual_hidden = (
+                    torch.zeros_like(state_feat) if self.use_dual_state else None
+                )
+                init_residual_hidden = (
+                    residual_hidden.clone() if residual_hidden is not None else None
+                )
+                init_trend_feat = trend_feat.clone()
+                init_residual_feat = (
+                    residual_feat.clone() if residual_feat is not None else None
+                )
                 all_state_args.append(
                     self._pack_state(
                         state_feat=state_feat,
@@ -1147,8 +1368,16 @@ class ARCroco3DStereo(CroCoNet):
                         init_state_feat=init_state_feat,
                         mem=mem,
                         init_mem=init_mem,
+                        trend_feat=trend_feat,
+                        residual_feat=residual_feat,
                         trend_hidden=trend_hidden,
-                        aux={"init_trend_hidden": init_trend_hidden},
+                        residual_hidden=residual_hidden,
+                        aux={
+                            "init_trend_hidden": init_trend_hidden,
+                            "init_residual_hidden": init_residual_hidden,
+                            "init_trend_feat": init_trend_feat,
+                            "init_residual_feat": init_residual_feat,
+                        },
                     )
                 )
 
@@ -1165,9 +1394,14 @@ class ARCroco3DStereo(CroCoNet):
                 pose_feat_i = None
                 pose_pos_i = None
                 
+            state_input = (
+                self._build_fused_state(trend_feat, residual_feat)
+                if self.use_dual_state
+                else state_feat
+            )
             # 得到更新后的 state 以及融合后的 img_feature
             new_state_feat, dec = self._recurrent_rollout(
-                state_feat,
+                state_input,
                 state_pos,
                 feat_i,
                 pos_i,
@@ -1200,31 +1434,88 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat, trend_hidden = apply_state_update(
-                state_feat=state_feat,
-                candidate_state_feat=new_state_feat,
-                init_state_feat=init_state_feat,
-                update_mask=update_mask,
-                reset_mask=None,
-                use_stable_propagation=self.use_stable_propagation,
-                trend_hidden=trend_hidden,
-                init_trend_hidden=init_trend_hidden,
-                propagator=self.trend_propagator,
-            )
+            if self.use_dual_state:
+                fused_state = self._build_fused_state(trend_feat, residual_feat)
+                delta = new_state_feat - fused_state
+                delta_tr, delta_res, _ = self.temporal_factorizer(delta)
+                trend_candidate = trend_feat + delta_tr
+                trend_feat, trend_hidden = apply_state_update(
+                    state_feat=trend_feat,
+                    candidate_state_feat=trend_candidate,
+                    init_state_feat=init_trend_feat,
+                    update_mask=update_mask,
+                    reset_mask=None,
+                    use_stable_propagation=self.use_stable_propagation,
+                    trend_hidden=trend_hidden,
+                    init_trend_hidden=init_trend_hidden,
+                    propagator=self.trend_propagator,
+                )
+                new_residual_feat, new_residual_hidden = self.residual_updater(
+                    residual_feat=residual_feat,
+                    delta_res=delta_res,
+                    residual_hidden=residual_hidden,
+                )
+                if residual_hidden is None:
+                    residual_hidden = torch.zeros_like(new_residual_hidden)
+                residual_feat = (
+                    new_residual_feat * update_mask + residual_feat * (1 - update_mask)
+                )
+                residual_hidden = (
+                    new_residual_hidden * update_mask
+                    + residual_hidden * (1 - update_mask)
+                )
+                state_feat = self._build_fused_state(trend_feat, residual_feat)
+            else:
+                state_feat, trend_hidden = apply_state_update(
+                    state_feat=state_feat,
+                    candidate_state_feat=new_state_feat,
+                    init_state_feat=init_state_feat,
+                    update_mask=update_mask,
+                    reset_mask=None,
+                    use_stable_propagation=self.use_stable_propagation,
+                    trend_hidden=trend_hidden,
+                    init_trend_hidden=init_trend_hidden,
+                    propagator=self.trend_propagator,
+                )
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state
             reset_mask = view["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
-                if trend_hidden is not None:
-                    if init_trend_hidden is None:
-                        init_trend_hidden = torch.zeros_like(trend_hidden)
-                    trend_hidden = (
-                        init_trend_hidden * reset_mask
-                        + trend_hidden * (1 - reset_mask)
+                if self.use_dual_state:
+                    trend_feat = (
+                        init_trend_feat * reset_mask + trend_feat * (1 - reset_mask)
                     )
+                    residual_feat = (
+                        init_residual_feat * reset_mask + residual_feat * (1 - reset_mask)
+                    )
+                    if trend_hidden is not None:
+                        if init_trend_hidden is None:
+                            init_trend_hidden = torch.zeros_like(trend_hidden)
+                        trend_hidden = (
+                            init_trend_hidden * reset_mask
+                            + trend_hidden * (1 - reset_mask)
+                        )
+                    if residual_hidden is not None:
+                        if init_residual_hidden is None:
+                            init_residual_hidden = torch.zeros_like(residual_hidden)
+                        residual_hidden = (
+                            init_residual_hidden * reset_mask
+                            + residual_hidden * (1 - reset_mask)
+                        )
+                    state_feat = self._build_fused_state(trend_feat, residual_feat)
+                else:
+                    state_feat = init_state_feat * reset_mask + state_feat * (
+                        1 - reset_mask
+                    )
+                    if trend_hidden is not None:
+                        if init_trend_hidden is None:
+                            init_trend_hidden = torch.zeros_like(trend_hidden)
+                        trend_hidden = (
+                            init_trend_hidden * reset_mask
+                            + trend_hidden * (1 - reset_mask)
+                        )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
                 self._pack_state(
@@ -1233,8 +1524,16 @@ class ARCroco3DStereo(CroCoNet):
                     init_state_feat=init_state_feat,
                     mem=mem,
                     init_mem=init_mem,
+                    trend_feat=trend_feat if self.use_dual_state else None,
+                    residual_feat=residual_feat if self.use_dual_state else None,
                     trend_hidden=trend_hidden,
-                    aux={"init_trend_hidden": init_trend_hidden},
+                    residual_hidden=residual_hidden if self.use_dual_state else None,
+                    aux={
+                        "init_trend_hidden": init_trend_hidden,
+                        "init_residual_hidden": init_residual_hidden,
+                        "init_trend_feat": init_trend_feat,
+                        "init_residual_feat": init_residual_feat,
+                    },
                 )
             )
         if ret_state:
